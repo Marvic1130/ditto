@@ -5,6 +5,8 @@ import random
 import os
 import tensorflow as tf
 from flearn.utils.model_utils import read_data
+from src.core import AppConfig
+from src.data.leaf_loader import load_leaf_datasets, load_leaf_splits_datasets
 
 # GLOBAL PARAMETERS
 OPTIMIZERS = ['fedsgd', 'fedavg', 'finetuning',
@@ -194,24 +196,96 @@ def read_options():
 
     return parsed, learner, optimizer
 
-def main():
+def main(cfg: AppConfig = None):
     # suppress tf warnings
     tf.logging.set_verbosity(tf.logging.WARN)
     
     # parse command line arguments
     options, learner, optimizer = read_options()
+    
+    # Override options with cfg if provided
+    if cfg:
+        options['dataset'] = cfg.dataset.name
+        options['batch_size'] = cfg.client.batch_size
+        options['num_rounds'] = cfg.num_rounds
+        options['clients_per_round'] = cfg.dataset.clients_per_round if cfg.dataset.clients_per_round else 10
+        options['learning_rate'] = cfg.server.inner_lr
+        options['num_epochs'] = cfg.client.local_epochs
+        options['seed'] = cfg.seed
+        
+        # Load LEAF data
+        print(f"Loading data from {cfg.dataset.root}...")
+        # Prefer explicit train/val routing if available; fall back to legacy json_files
+        train_files = getattr(cfg.dataset, 'train_json_files', None) or getattr(cfg.dataset, 'json_files', None)
+        train_datasets = load_leaf_datasets(
+            root=cfg.dataset.root,
+            split="train",
+            limit=cfg.dataset.num_clients,
+            files=train_files
+        )
+        
+        val_files = getattr(cfg.dataset, 'val_json_files', None)
+        test_files = val_files or ([f.replace("train", "test", 1) for f in train_files] if train_files else None)
+            
+        try:
+            test_datasets = load_leaf_datasets(
+                root=cfg.dataset.root,
+                split="test",
+                limit=cfg.dataset.num_clients,
+                files=test_files
+            )
+        except Exception as e:
+            print(f"Warning: Failed to load test data: {e}")
+            test_datasets = {}
+            
+        # Ditto expects dataset as tuple (users, groups, train_data, test_data)
+        # train_data and test_data are dicts: {user: {'x': ..., 'y': ...}}
+        # But load_leaf_datasets returns TensorDatasets.
+        # We need to convert them or adapt Ditto's trainer.
+        # Ditto uses TensorFlow!
+        # Wait, Ditto implementation here uses TensorFlow?
+        # "import tensorflow as tf" is present.
+        # But HyperQLoRA is PyTorch based.
+        # If Ditto is TF based, we cannot easily integrate it with PyTorch data loaders and models.
+        # Let's check if Ditto has a PyTorch implementation or if we need to convert data.
+        
+        # If Ditto is TF, we might have a problem sharing the same environment/GPU resources efficiently if not careful.
+        # But more importantly, the data format.
+        
+        # Let's check flearn/models/femnist/cnn.py to see if it is TF or PyTorch.
+        pass
 
-    # read data
-    train_path = os.path.join('data', options['dataset'], 'data', 'train')
-    test_path = os.path.join('data', options['dataset'], 'data', 'test')
-    dataset = read_data(train_path, test_path)
+        # Load LEAF data via unified routing
+        print(f"Loading data from {cfg.dataset.root}...")
+        train_files = getattr(cfg.dataset, 'train_json_files', None) or getattr(cfg.dataset, 'json_files', None)
+        val_files = getattr(cfg.dataset, 'val_json_files', None)
+        train_datasets, test_datasets, _ = load_leaf_splits_datasets(
+            root=cfg.dataset.root,
+            train_files=train_files,
+            val_files=val_files,
+            holdout_files=None,
+            limit=cfg.dataset.num_clients,
+        )
+            
+            if uid in test_datasets:
+                ted = test_datasets[uid]
+                x_test, y_test = ted.tensors
+                test_data[uid] = {'x': x_test.numpy(), 'y': y_test.numpy()}
+            else:
+                test_data[uid] = {'x': np.array([]), 'y': np.array([])}
+                
+        dataset = (users, groups, train_data, test_data)
 
     # call appropriate trainer
     t = optimizer(options, learner, dataset)
     t.train()
-    
-if __name__ == '__main__':
-    main()
+
+class DittoWrapper:
+    def __init__(self, args, cfg=None):
+        self.cfg = cfg
+        
+    def run(self):
+        main(cfg=self.cfg)
 
 
 
